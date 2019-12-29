@@ -1,0 +1,802 @@
+---
+title: Analysis and prediction of car accidents in Los Alngeles based on the collisions
+  data from 2010 to 2019
+author: "Ali Behroozfar"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Abstract {#css_id}
+In this project, Los Angeles traffic collision instances occurred from 2010 to 2019 are analyzed. In the relevant time series dataset, several variables including time/date of accidents, locations and some demographic information about the drivers are available. The main goals of this project are to analyze the effects of the variables on the number of collisions in different locations in LA and also predict the future trends/number of accidents in those areas. Since this project will provide information about the number of accidents in different days in different areas, its results can be used by all organizations which are responsible for the services required after a collison happens. Organizatins such as insurance companies, police department,traffic control companies, toll companies and health services will need such predictions for faster and more reliable services.
+
+
+## Dataset overview {#css_id}
+This dataset has 488384 instances of the car collisions in LA with 24 variables (the dataset is available on Kaggle). Some variables such as drivers’ license numbers, MO codes, Address and zip codes are not required for analysis purposes and are dropped from the dataset. The variables which might be useful are: Date Reported, Date Occurred, Time Occurred, Area ID, Area Name, Victim Age, collision location, Premise Code, Premise Description Reporting District, Crime Code, and Crime Code Description. 
+
+## Libraries which are required {#css_id}
+In the begining the needed libraries are added.
+
+```{r include=FALSE}
+rm(list = ls())
+library(data.table) 
+library(readr) 
+library(tidyverse) 
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(imputeTS)
+library(rmarkdown)
+library(fpp2)
+library(GGally)
+library(gridExtra)
+library(maps)
+library(ggmap)
+library(leaflet)
+library(urca)
+library(qdapRegex)
+pacman::p_load(dplyr, fpp2, GGally, gridExtra)
+```
+
+## Processing the Data {#css_id}
+The dataset is read and the features with their numbers of Null instances are listed below.
+
+```{r}
+collision_original<- read_csv("traffic-collision-data-from-2010-to-present.csv")
+map_int(collision_original,function(.x) sum(is.na(.x)))
+```
+
+
+
+Here, the useful features are selected:
+
+```{r}
+collision<-collision_original[,c("Date Reported","Date Occurred","Time Occurred","Area ID","Area Name","Reporting District","Crime Code","Crime Code Description","Victim Age","Victim Sex","Victim Descent","Premise Code","Premise Description","Location","Census Tracts")]
+```
+
+The selected features and the number of null instances are listed below:
+
+```{r}
+map_int(collision,function(.x) sum(is.na(.x)))
+```
+
+Here it can be seen if the data is sorted based on the timestamp. According to the result it is sorted.
+
+```{r}
+is.unsorted(collision)
+```
+
+```{r}
+collision<- collision[seq(dim(collision)[1],1),]
+```
+
+
+## Missing value imputation for Null ages in the dataset {#css_id}
+To make some useful visuallizations specially for Age variable, we need to impute the Null values. The data set is a time series so we cannot easily drop the Null values. Imputation is done to impute the age variables in this data set.
+So different functions of Kalman method and moving average were tested to choose the closest distribution of ages after imputation to the original age distribution.
+
+```{r}
+collision$age_kalman<-na.kalman(collision$`Victim Age`)
+collision$age_ma_exp<-na.ma(collision$`Victim Age`,k=4,weighting = "exponential")
+```
+
+```{r}
+collision$age_ma_sim<-na.ma(collision$`Victim Age`,weighting = "simple")
+collision$age_ma_lin<-na.ma(collision$`Victim Age`,weighting = "linear")
+collision$age_mean<-na.mean(collision$`Victim Age`)
+```
+
+The different age distributions after imputation using KAlman are shown below. The first graph show the age distribution in the original dataset.The second one is imputation by Kalman smoothinh (which is not good).Imputation by weighted moving average is in good agreement with the oroginal age distribuion.
+```{r}
+hist(collision$`Victim Age`,breaks = 50)
+hist(collision$age_kalman,breaks = 50)
+hist(collision$age_ma_exp,breaks = 50)
+hist(collision$age_ma_sim,breaks = 50)
+hist(collision$age_mean,breaks = 50)
+hist(collision$age_ma_lin,breaks = 50)
+```
+
+```{r}
+mean(collision$age_kalman)
+mean(collision$age_ma_exp)
+
+mean(collision$age_ma_sim)
+
+mean(collision$age_mean)
+
+mean(collision$age_ma_lin)
+
+```
+
+
+
+```{r}
+collision$age<-collision$age_ma_exp
+
+```
+
+```{r}
+mean(collision$age)
+```
+
+
+```{r}
+map_int(collision,function(.x)sum(is.na(.x)))
+```
+
+```{r}
+plotNA.distribution(collision$age)
+```
+people in CA can get the drivers lisence at the age of 16 to 18 years old (driving with a person above 25 yo in the car) and at 18 and above (driving alone). Also it seems in some cases with low ages, the ages were rounded up to 20 (the dataset is censored). It has not happened in the recent years.
+In addition, there are many cases with the age of 99. Again it seems for a particular age rane (probably 80+), the ages were rounded up to 99.
+so it is better to analyze the age variable based on the age bins (like: <40, 40-60, 60-80 , >80) It should be noted that there are few report on accidents with ages below 16. Lets take a look at the outliers:  
+
+
+```{r}
+hist(collision$age,breaks = 50)
+
+```
+
+```{r}
+nrow(collision[collision$age==99,])
+nrow(collision[collision$age<16,])
+```
+6003 out of 488384 cases in the dataset were rounded up to 99
+99 out of 488384 cases in the dataset report ages below 16 (these ages should be wrong). 
+
+
+```{r}
+collision[collision$age<16,]
+```
+Knowing this fact, I made 4 different bins and did analysis based on those bins. All ages below 40 were put in the first bin. In other sections of this report the analysis on age in different areas can be seen.
+
+```{r}
+collision$`Victim Sex`%>%table()
+collision$`Victim Sex`%>%is.na()%>%sum()
+```
+## Preparing the dataset for timeseries alanysis {#css_id}
+The timestamp colomn of the dataset should be devided to days, months and years for further analysis. Specially "Day" variable is important for us for predicting purposes. 
+
+```{r}
+collision$Date<- as.POSIXct(collision$`Date Occurred`,format="%m/%d/%Y")
+collision$Month <- month(collision$Date, label=TRUE)
+collision$Weekday <-wday(collision$Date, label=TRUE)
+collision$Year <- year(collision$Date)
+collision$Day <-day(collision$Date)
+
+```
+
+Names of the features are being changes to simpler ones:
+```{r}
+names(collision)<-c("date_reported","date_occured","time_occured","area_id","area_name","district","crime_code","crime_desciption","victim_age","sex","descent","premise","premise_description","Location","Census_Tracts","ageage_kalman","age_ma_exp","age_ma_sim","age_mean","age_ma_lin","age","date","month","weekday","year","day")
+names(collision)
+```
+
+Also time of the accidents is important for our analysis. The visualizations on time variable is very informative for preventive actions.
+```{r}
+collision$time <- as.POSIXct(collision$time_occured,format="%H%M")
+collision$time <- hour(collision$time)
+names(collision)
+```
+
+The pie chart below shows different areas of LA with their corresponding total number of acidents in the ascending order (clockwise). According to this chart, "77th Street" which is on the south of LA downtown had the highest number of collisions.
+```{r}
+xxx<-as.data.table(table(collision$area_name))
+xxx<-arrange(xxx,N)
+pie(xxx$N,clockwise = TRUE,
+    labels=paste(xxx$V1), radius=1 )
+```
+
+## Heatmaps showing distribution of collisions in different areas of LA through days of the week {#css_id}
+In the heatmaps showed below, distribution of the number of car collisions through days of the week is shown for different areas of LA. As shown below, on the weekdays, most accidents happen during business hours specially at the time that people are going back to home in afternoon. However, on weekends, we see high number of accidents ate at night in the areas near Downtown LA and areas with more resturants and bars (For example, there is a high number of collisions in Hollywood area in Saturday and Sunday early morning (1-3 am)).
+
+```{r}
+hourly_wise_count<-collision %>% group_by(time,area_name,weekday) %>% count()
+col1 = "#d8e1cf" 
+col2 = "#438484"
+
+
+ggplot(hourly_wise_count[hourly_wise_count$weekday=='Mon',], aes(time,area_name)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision in different areas through Mondays: ",
+       x = "Collision Per Hour", y = "Area Name") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(hourly_wise_count[hourly_wise_count$weekday=='Tue',], aes(time,area_name)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision in different areas through Tuesdays: ",
+       x = "Collision Per Hour", y = "Area Name") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(hourly_wise_count[hourly_wise_count$weekday=='Wed',], aes(time,area_name)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision in different areas through Wednesday: ",
+       x = "Collision Per Hour", y = "Area Name") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(hourly_wise_count[hourly_wise_count$weekday=='Thu',], aes(time,area_name)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision in different areas through Thursdays: ",
+       x = "Collision Per Hour", y = "Area Name") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(hourly_wise_count[hourly_wise_count$weekday=='Fri',], aes(time,area_name)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision in different areas through Fridays: ",
+       x = "Collision Per Hour", y = "Area Name") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(hourly_wise_count[hourly_wise_count$weekday=='Sat',], aes(time,area_name)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision in different areas through Saturdays: ",
+       x = "Collision Per Hour", y = "Area Name") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(hourly_wise_count[hourly_wise_count$weekday=='Sun',], aes(time,area_name)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision in different areas through Sundays: ",
+       x = "Collision Per Hour", y = "Area Name") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+```{r}
+collision$age_range[collision$age_ma_exp<40]<-20
+collision$age_range[(collision$age_ma_exp>=40)&(collision$age_ma_exp<60)]<-40
+collision$age_range[(collision$age_ma_exp>=60)&(collision$age_ma_exp<80)]<-60
+collision$age_range[collision$age_ma_exp>=80]<-80
+
+collision$age_range<-as.factor(collision$age_range)
+collision %>% group_by(age_range)%>% count()
+```
+
+## Effects of driver's age on the distribution of the accidents counts in different days of the wek {#css_id}
+It is expected to have different distributions for number of accidents hapened by differnet ages. In this section we see the effet of this variable on the accident count distribuiton.
+For younger drivers (age<40) we see high number of accidents at weekend nights. However sum of the acccident occured by this age group is not noticeable at weekdays nights. it seems number of drunk drivers is more in this age group causing these accidents at weekend nights (no surprise).
+Also in the weekdays mornings and afternoons there are peaks in the collison dstribution. In the old drivers group, there is only a peak in the afternoon in all days of the week. 
+This information determines the main types of the services (and the age targets recienving the services)in differet times and days.
+
+```{r}
+
+collision_sun<-collision[collision$weekday=='Sun',]
+collision_Tue<-collision[collision$weekday=='Tue',]
+
+
+hourly_age20_count<-collision_sun[collision_sun$age_range==20,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age20_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Hourly number of collisions for age <40 on Sundays')+
+  geom_bar(stat = "identity")
+
+
+hourly_age20_count<-collision_Tue[collision_Tue$age_range==20,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age20_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Hourly number of collisions for age <40 on Tuesdays')+
+  geom_bar(stat = "identity")
+
+
+hourly_age20_count<-collision[collision$age_range==20,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age20_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Overal Hourly number of collisions for age <40')+
+  geom_bar(stat = "identity")
+```
+
+ages between 40 and 60
+
+
+```{r}
+collision_sun<-collision[collision$weekday=='Sun',]
+collision_Tue<-collision[collision$weekday=='Tue',]
+
+
+hourly_age40_count<-collision_sun[collision_sun$age_range==40,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age20_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Hourly number of collisions for age between 40 and 60 on Sundays')+
+  geom_bar(stat = "identity")
+
+
+hourly_age40_count<-collision_Tue[collision_Tue$age_range==40,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age20_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Hourly number of collisions for age between 40 and 60 on Tuesdays')+
+  geom_bar(stat = "identity")
+
+
+hourly_age40_count<-collision[collision$age_range==40,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age20_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Overal Hourly number of collisions for age between 40 and 60')+
+  geom_bar(stat = "identity")
+```
+
+
+
+ages between 60 and 80
+
+```{r}
+
+collision_sun<-collision[collision$weekday=='Sun',]
+collision_Tue<-collision[collision$weekday=='Tue',]
+
+
+hourly_age60_count<-collision_sun[collision_sun$age_range==60,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age60_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Hourly number of collisions for age between 60 and 80 on Sundays')+
+  geom_bar(stat = "identity")
+
+
+hourly_age60_count<-collision_Tue[collision_Tue$age_range==60,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age60_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Hourly number of collisions for age between 60 and 80 on Tuesdays')+
+  geom_bar(stat = "identity")
+
+
+hourly_age60_count<-collision[collision$age_range==60,] %>% group_by(time) %>% count()
+ggplot(data=hourly_age60_count,aes(x=as.factor(time),y=n))+
+  labs(x='Hour',y='Number of collisions',title = 'Overal Hourly number of collisions for age between 60 and 80')+
+  geom_bar(stat = "identity")
+```
+
+
+In the heatmaps shown below, distribution of the accidents through days of the week caused by different age groups are shown. 
+
+```{r}
+age_count<-collision %>% group_by(time,age_range,weekday) %>% count()
+col1 = "#d8e1cf" 
+col2 = "#438484"
+
+
+ggplot(age_count[age_count$weekday=='Mon',], aes(time,age_range)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision for different ages through Mondays: ",
+       x = "Collision Per Hour", y = "Age range") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(age_count[age_count$weekday=='Tue',], aes(time,age_range)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision for different ages through Tuesdays: ",
+       x = "Collision Per Hour", y = "Age range") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(age_count[age_count$weekday=='Wed',], aes(time,age_range)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision for different ages through Wednesdays: ",
+       x = "Collision Per Hour", y = "Age range") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(age_count[age_count$weekday=='Thu',], aes(time,age_range)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision for different ages through Thursdays: ",
+       x = "Collision Per Hour", y = "Age range") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(age_count[age_count$weekday=='Fri',], aes(time,age_range)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision for different ages through Fridays: ",
+       x = "Collision Per Hour", y = "Age range") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+ggplot(age_count[age_count$weekday=='Sat',], aes(time,age_range)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision for different ages through Saturdays: ",
+       x = "Collision Per Hour", y = "Age range") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggplot(age_count[age_count$weekday=='Sun',], aes(time,age_range)) + geom_tile(aes(fill = n),colour = "white") +
+  scale_fill_gradient(low = "yellow", high = "red") +  
+  guides(fill=guide_legend(title="Number of collision")) +
+  theme_bw() + theme_minimal() + 
+  labs(title = "LA collision for different ages through Sundays: ",
+       x = "Collision Per Hour", y = "Age range") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+
+Here are some visualizations on the total number of accidents in LA grouped by years, months and days of the week.
+An increase in the total number of accident can be seen in 2014-2016. Before and after this time period there was not a noticeable trend. Number of accidents in 2019 is low because almost half of the year was counted (up to Aufust 31 2019).
+```{r}
+year_wise_count<-collision %>% group_by(year) %>% count()
+year_wise_count
+ggplot(data=year_wise_count,aes(x=as.factor(year),y=n))+
+  labs(x='Year',y='Number of collisions',title = 'number of car collisions per year')+
+  geom_bar(width = 0.65, stat = "identity")
+```
+
+
+```{r}
+month_wise_count<-collision %>% group_by(month) %>% count()
+month_wise_count
+ggplot(data=month_wise_count,aes(x=as.factor(month),y=n))+
+  labs(x='Month',y='Number of collisions',title = 'total number of collisions in different months')+
+  geom_bar(width = 0.65,stat = "identity")
+```
+
+
+```{r}
+day_wise_count<-collision %>% group_by(weekday) %>% count()
+day_wise_count
+ggplot(data=day_wise_count,aes(x=as.factor(weekday),y=n))+
+  labs(x='Day',y='Number of collisions',title = 'Daily number of collisions')+
+  geom_bar(width=0.6,stat = "identity")
+```
+
+## Time series analysis {#css_id}
+According to the results reported in the previous sections, area "77th Street" has the highest number of collisions among all areas in Los Angeles. Therefore, this area is the most critical area in the city. So we start out study with this area, do some statistical analysis, compare the results of different models in predicting the future collisions, then we extend the study to other areas in LA. 
+
+```{r}
+collision_daily <- collision[collision$area_name=='77th Street',] %>%
+  group_by(date) %>%
+  summarize(count = n()) %>%
+  arrange(date)
+
+```
+
+The graph below shows the number of daily collisions in "77th street" from 2010 to 2019. 
+```{r}
+collision_daily
+collision_ts<-as.ts(collision_daily$count)
+
+autoplot(collision_ts) +
+  ggtitle("Collision in 77th Street") +
+  xlab("Year") + ylab("Counts") 
+
+```
+
+ACF and PACF graphs give us some ideas about the seasonality of the time series and some hints to improve the model.
+According to ACF graph, the time series is not stationary. We do the first order differencing to see if any improvement happens. Results show that after aplying first order differencing, the time series gets more strationary. Also taking log doesnt improve the time series significantly. The variation of the "counts" is almsost contant in the different time periods.
+
+```{r}
+ggAcf(collision_ts)
+autoplot(diff(collision_ts)) + ylab("Change in Dow Jones Index") + xlab("Day")
+autoplot(diff(log(collision_ts))) + ylab("Change in Dow Jones Index") + xlab("Day")
+ggPacf(diff(collision_ts))
+ggAcf(diff(collision_ts))
+```
+After taking one differencing, the conditions below are somehow satisfied, but not perfectly.
+1-ACF is exponentially decaying or sinusoidal
+2-There is a significant spike at lag p in the PACF, but none beyond lag p
+Since it is hard to say that the conditions above are satisfied, we need to look at different p and q to find a proper combinations. 
+We can start with (p,d,q)=(1,1,0) but more investigations will be done. 
+
+Also kpss test of the time series shown below confirms that the original time series is not stationary 
+
+(t-stat is larger than the critical values: 
+Value of test-statistic is: 23.2493 
+Critical value for a significance level of: 
+                10pct  5pct 2.5pct  1pct
+critical values 0.347 0.463  0.574 0.739).
+
+(Also "ndiffs" suggests that first order differencing is enough for this time series)
+After taking the difference, kpss test confirms that the time series is stationary 
+
+(Value of test-statistic is: 0.0033 
+Critical value for a significance level of: 
+                10pct  5pct 2.5pct  1pct
+critical values 0.347 0.463  0.574 0.739).
+
+```{r}
+summary(ur.kpss(collision_ts))
+ndiffs(collision_ts)
+collision_ts %>% diff() %>% ur.kpss() %>% summary() 
+```
+
+First we try with auto ARIMA. It suggests ARIMA(3,1,1). The AIC and BIC scores are shown below:
+
+```{r}
+auto.arima(collision_ts)
+```
+
+Then I tried to combine different numbers of p and q (from 0 to 6) and stored all AIC and BIC scores.The model which provides the minimum AIC or BIC (preferred) will be selected:
+
+```{r}
+outp <- matrix(0,7^2,5)
+count <- 1
+for(i in 0:6){
+  for(j in 0:6){
+    model <- Arima(collision_ts,c(i,1,j))
+    outp[count,] <- c(i,1,j,AIC(model),BIC(model))
+    count <- count + 1
+  }
+}
+outp <- data.table(outp)
+names(outp) <- c('p','d','q','aic','bic')
+outp
+outp[aic==0,]$aic <- 9999
+outp[bic==0,]$bic <- 9999
+outp[which.min(outp$aic),,]
+outp[which.min(outp$bic),,]
+```
+ARIMA(3,1,4) provides the minimum BIC: 18060.71
+ARIMA(4,1,5) provides the minimum AIC: 18007.76
+
+from auto arima we had :  ARIMA(3,1,1) with BIC of 18171
+Since lower BIC and AIC are better, the auto arima result shouldnt be selected. 
+In the tables below, we see all the models,ordered based on BICs and AICs:
+
+
+```{r}
+outp[order(bic),]
+outp[order(aic),]
+```
+
+The predictions based on ARIMA (3,1,4) is done below. Also the residuals are checked to make sure the errors are stationary (they are white noise):
+
+```{r}
+fit <- arima(collision_ts, order = c(3,1,4))
+checkresiduals(fit)
+
+fit%>%forecast(h=30)%>%autoplot(include=300)+xlab("day")+ylab("number of collision")
+```
+Residual check confirms that the errors are stationary. SO we can use ARIMA(3,1,4) to predict the future collisions in area "77th street".
+
+If we check the residuals of auto arima model, we see that the errors are not stationary so it is not a good model to predict the future events (its variation is a lot):
+
+```{r}
+fit <- auto.arima(collision_ts)
+checkresiduals(fit)
+
+fit%>%forecast(h=30)%>%autoplot(include=300)+xlab("day")+ylab("number of collision")
+```
+
+Here we make train and test sets to test the accuracy of the model. I chose the last 25 days of the time series as the test set:
+
+```{r}
+collision_train<-window(collision_ts,end=3500)
+collision_test<-window(collision_ts,start=3501)
+collision_test
+```
+
+And here is the accuracy of the model with the minimum BIC and stationary errors (ARIMA(3,1,4)):
+
+```{r}
+fit_1 <- arima(collision_train, order = c(3,1,4))
+collision_tr<-forecast(fit_1,h=25)
+
+collision_tr
+accuracy(collision_tr,collision_test)
+```
+
+These are the accuracy numbers of auto arima model (ARIMA(3,1,1)):
+
+```{r}
+fit_1 <- auto.arima(collision_train, seasonal = FALSE)
+collision_tr<-forecast(fit_1,h=25)
+
+collision_tr
+accuracy(collision_tr,collision_test)
+```
+
+And also I ran a neural network model (using nnetar function which is a feed forward NN with a single hiden layer and lagged input), predict the 25 days and calculate the accuracy of the model:
+
+```{r}
+fit_nn<-nnetar(collision_ts)
+```
+
+```{r}
+pred_nn<-forecast(fit_nn,h=30)
+autoplot(pred_nn,holdout=collision_ts, include = 300)
+```
+
+
+
+```{r}
+collision_train<-window(collision_ts,end=3500)
+collision_test<-window(collision_ts,start=3501)
+
+fit_nn<-nnetar(collision_train)
+pred_nn<-forecast(fit_nn,h=25,PI = TRUE)
+autoplot(pred_nn,holdout=collision_ts)
+accuracy(pred_nn,collision_test)
+```
+The accuracy results of the three different approaches show that the ARIMA model with the minimum BIC provides lower errors compared to the other models.
+
+
+
+```{r}
+area_name_table<-as.data.table(collision$area_name%>%table())
+area_name_table$.
+
+```
+
+Here we do the same thing for other areas of LA to find ARIMA models with minimum BICc:
+(This chunk creates a table (al_areas) which contain all 21 areas in LA with their best p and q which result in the minimum BIC for their corresponding model)
+
+```{r}
+
+all_areas <- as.data.table(matrix(0,21,6))
+for(k in 1:21){
+
+
+collision_daily <- collision[collision$area_name==area_name_table$.[k],] %>%
+  group_by(date) %>%
+  summarize(count = n()) %>%
+  arrange(date)
+
+collision_daily
+collision_ts<-as.ts(collision_daily$count)
+
+ndiffs(collision_ts)
+
+outp <- matrix(0,4*5,5)
+count <- 1
+for(i in 0:3){
+  for(j in 0:4){
+    #model <- Arima(collision_ts,c(i,1,j),method = "ML")
+    model <- Arima(collision_ts,c(i,1,j))
+
+    outp[count,] <- c(i,1,j,AIC(model),BIC(model))
+    count <- count + 1
+  }
+}
+outp <- data.table(outp)
+names(outp) <- c('p','d','q','aic','bic')
+outp[aic==0,]$aic <- 99999
+outp[bic==0,]$bic <- 99999
+outp[which.min(outp$aic),,]
+outp[which.min(outp$bic),,]
+
+
+all_areas[k,] <- c(k,outp[which.min(outp$bic),,][,1],1,outp[which.min(outp$bic),,][,3], outp[which.min(outp$bic),,][,4],outp[which.min(outp$bic),,][,5])
+names(all_areas)<-c('Area Name','p','d','q','aic','min bic')
+
+
+}
+all_areas
+all_areas$`Area Name`<-as.character(all_areas$`Area Name`)
+for (i in 0:21){
+all_areas$`Area Name`[i]<-area_name_table$.[i]
+}
+all_areas
+
+```
+
+
+```{r}
+for(k in 1:21){
+  collision_daily <- collision[collision$area_name==area_name_table$.[k],] %>%
+  
+  group_by(date) %>%
+  summarize(count = n()) %>%
+  arrange(date)
+
+ndiffs(collision_ts)
+collision_ts<-as.ts(collision_daily$count)
+
+#fit <- arima(collision_ts, order = c(all_areas$p[k],1,all_areas$q[k]),method = "ML")
+fit <- arima(collision_ts, order = c(all_areas$p[k],1,all_areas$q[k]))
+
+}
+```
+
+This chunk predict the future collision numbers (next 100 days) and save them in a table called: "all_pred
+THis table is being saved as a ".csv" file and will be used by a shinny app for visualization purposes (using the map of LA)
+```{r}
+all_pred <- as.data.table(matrix(0,2100,1))
+for(k in 1:21){
+  collision_daily <- collision[collision$area_name==area_name_table$.[k],] %>%
+  group_by(date) %>%
+  summarize(count = n()) %>%
+  arrange(date)
+
+collision_ts<-as.ts(collision_daily$count)
+fit <- arima(collision_ts, order = c(all_areas$p[k],1,all_areas$q[k]))
+forecast<-as.data.table(forecast(fit,h=100))
+  for (i in 1:100){
+    j<-(k-1)*100+i
+    all_pred[j]<-forecast[i,1]
+  }
+
+}
+write.csv(all_pred, "all_pred.csv")
+```
+
+In this chunk, location data of the original data set is being used. For that purpose, the longitude and latitude of the locations should be extracted from the "Location" string (that string contains different information about the location but we just need the longitude and latitude numbers.) 
+This is an axample of a location value in one row of the dataset: 
+{'latitude': '34.1975', 'longitude': '-118.5623', 'human_address': '{"address": "", "city": "", "state": "", "zip": ""}'}
+So we need to work on the string and extract the "lon" and "lat" values:
+(the extracted coordinates will be added to "collision_lat_lon" table and saved as a ".csv" for the shinny app)
+
+```{r}
+collision_location<-rm_between(collision$Location, "'", "'", extract=TRUE)
+length(collision_location)
+collision_lat_lon<-as.data.table(matrix(0,length(collision_location),2))
+for (i in 1:length(collision_location)){
+  collision_lat_lon[i,1]<-as.double(collision_location[[i]][2])
+  collision_lat_lon[i,2]<-as.double(collision_location[[i]][4])
+}
+write.csv(collision_lat_lon, "collision_lat_lon.csv")
+```
+
+and the numbers of longitudes and latidudes are added to the new columns in the man dataset
+
+```{r}
+collision_lat_lon<-as.matrix(collision_lat_lon)
+collision$latitude<-as.numeric(collision_lat_lon[,1])
+collision$longitude<-as.numeric(collision_lat_lon[,2])
+
+collision_1<-collision
+write.csv(collision_1, "collision_1.csv")
+```
+
+In this chunk, we take average of lonitude and latiude numbers for each area. It gives the spots in the areas  which are actually centers of the acident locations in those areas.These sports are useful for visualization purposes. Using these spots on the map, we can have some ideas about the places which will have higher number of accidents.
+
+```{r}
+for(k in 1:21){
+  col<-collision[collision$area_name==all_areas$`Area Name`[k],]
+  all_areas$mean_lat[k]<-mean(col$latitude)
+  all_areas$mean_lon[k]<-mean(col$longitude)
+  }
+```
+
+
+Here, we can make a table which contains total number of predicted accidents for a specific time period in the future (for example in the "f" following days totally or in the "n"th day from now)
+In this chunk two random values are selected. But in the shiny app, the time can be used by the user. So the data about the entered time selected by the user will be shown on the map.
+
+```{r}
+f<-7
+n<-4
+j<-0
+for(k in 1:21){
+  all_areas$sum[k]<-0
+  for (i in 1:f){
+    j<-(k-1)*100+i
+    all_areas$sum[k]<-all_pred[j]+all_areas$sum[k]
+  }
+}
+for(k in 1:21){
+    j<-(k-1)*100+n
+    all_areas$n_day[k]<-all_pred[j]
+}
+all_areas$sum<-as.numeric(all_areas$sum)
+all_areas$n_day<-as.numeric(all_areas$n_day)
+write.csv(all_areas, "all_areas.csv")
+```
+
+In this chunk, predicted number of accidents in different areas are shown on the map.The time period was selected in the previous chunks. However it can be customzed by the user in the shiny app.
+THe color of the circles shows the number of accidents in the areas. (red: more accidents, green: less, yellow: something in between). If you put the mouse pointer on the spots you can see the predicted numbers. If you click on the spot, the area name will be shown.
+
+```{r eval=FALSE, include=FALSE}
+register_google(key = "YOUR_API_KEY")
+has_google_key()
+
+pal<-colorNumeric("RdYlGn",domain = as.numeric(all_areas$n_day),reverse = TRUE)
+m <- leaflet(all_areas) %>%
+addTiles() %>% 
+addCircleMarkers(lng = all_areas$mean_lon, lat = all_areas$mean_lat,popup = all_areas$`Area Name`,fillOpacity = 0.8,stroke = TRUE ,radius = 15,color = pal(as.numeric(all_areas$n_day)),label =as.character(ceiling(as.numeric(all_areas$sum))))
+
+m 
+
+```
+
+## Map can be seen in the HTML version of the report. {#css_id}
+
+
+
